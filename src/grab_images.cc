@@ -37,18 +37,24 @@ void mask_depth(Mat &image, Mat &th, int throld = 1000) {
 // 参数一depth是realsense返回的深度图（ushort型）
 // 参数二thresh和参数三max_thresh，是二值化的参数
 // 参数四是凸包的最小有效面积，小于这个面积的障碍物可以视为噪点
-vector<vector<Point>> find_obstacle(Mat &depth, int thresh = 20,
+vector<vector<Point>> find_obstacle(Mat &depth, int thresh = 15,
                                     int max_thresh = 255, int area = 500) {
   Mat dep;
+
   // imshow("depth", depth);
 
   // 得到和depth一样的矩阵dep 不一定申请新的内存空间
   depth.copyTo(dep);
+  cout << "head_dep" << endl;
+  cout << dep << endl;
 
   // 将安全距离外的像素点置零 不考虑
-  mask_depth(depth, dep, 12000);
+  mask_depth(depth, dep, 4500);
 
-  dep.convertTo(dep, CV_8UC1);
+  dep.convertTo(dep, CV_8UC1, 1.0 / 4.0);
+
+  // cout << "dep_8" << endl;
+  // cout << dep << endl;
   // dep.convertTo(dep, CV_8UC1, 1.0 / 16);
 
   Mat element =
@@ -83,6 +89,8 @@ vector<vector<Point>> find_obstacle(Mat &depth, int thresh = 20,
   // 对图像进行二值化
   threshold(dep, threshold_output, thresh, 255, CV_THRESH_BINARY);
   // mask_depth(src, threshold_output);
+  cout << "head_binary" << endl;
+  // cout << threshold_output << endl;
 
   imshow("threshold_output", threshold_output);
 
@@ -206,18 +214,10 @@ void Differ() {
   }
 }
 
-int main(int argc, char **argv) {
 
-  // Mat image_1 = imread("1_depth_image.png", IMREAD_ANYDEPTH);
-  // Mat image_2 = imread("2_depth_image.png", IMREAD_ANYDEPTH);
-  // Mat image_3 = imread("depth_average.png", IMREAD_ANYDEPTH);
-  
-  // Mat differ = image_1 - image_3;
-  // cout << differ << endl;
-  // Mat media;
-  // medianBlur(differ, media, 5);
-  // cout << media << endl;
-  #if 1
+
+int main(int argc, char **argv) {
+#if 1
   rs2::pipeline pipe;
   rs2::config cfg;
 
@@ -230,18 +230,40 @@ int main(int argc, char **argv) {
   string depth_name;
   uint depth_count = 1;
   Mat depth_u8;
+  Mat filter_image_u8;
   Mat depth_average = imread("depth_average.png", IMREAD_ANYDEPTH);
   Mat media;
   medianBlur(depth_average, media, 5);
-  Mat depth_total;
+  Mat depth_temp = Mat::zeros(depth_average.size(), CV_16UC1);
+  rs2::decimation_filter decimation_filter;
+  rs2::spatial_filter spatial_filter;
+  rs2::temporal_filter temporal_filter;
 
   // cout << depth_average << endl;
 
   // 配置并启动管道
   cfg.enable_stream(RS2_STREAM_DEPTH, WIDTH, HEIGHT, RS2_FORMAT_ANY, FRAMERATE);
-  cfg.enable_stream(RS2_STREAM_COLOR, WIDTH, HEIGHT, RS2_FORMAT_ANY, FRAMERATE);
+  cfg.enable_stream(RS2_STREAM_COLOR, WIDTH, HEIGHT, RS2_FORMAT_BGR8,
+                    FRAMERATE);
   pipe.start(cfg);
-  
+
+  // filter初始化
+  // Set Decimation Filter Option
+  if (decimation_filter.supports(rs2_option::RS2_OPTION_FILTER_MAGNITUDE)) {
+    rs2::option_range option_range = decimation_filter.get_option_range(
+        rs2_option::RS2_OPTION_FILTER_MAGNITUDE);
+    decimation_filter.set_option(
+        rs2_option::RS2_OPTION_FILTER_MAGNITUDE,
+        option_range.min);  // 1(min) is not downsampling
+  }
+
+  // Set Spatial Filter Option
+  if (spatial_filter.supports(rs2_option::RS2_OPTION_HOLES_FILL)) {
+    rs2::option_range option_range =
+        spatial_filter.get_option_range(rs2_option::RS2_OPTION_HOLES_FILL);
+    spatial_filter.set_option(rs2_option::RS2_OPTION_HOLES_FILL,
+                              option_range.max);  // 5(max) is fill all holes
+  }
 
   // 标定
   while (true) {
@@ -252,36 +274,50 @@ int main(int argc, char **argv) {
     rs2::frame color = frames.get_color_frame();
     rs2::depth_frame depth = frames.get_depth_frame();
 
+    rs2::frame filtered_frame = depth;
+
+    // 应用抽取滤波器（下采样）
+    filtered_frame = decimation_filter.process( filtered_frame );
+
+    // 从深度帧转换视差帧
+    rs2::disparity_transform disparity_transform( true );
+    filtered_frame = disparity_transform.process( filtered_frame );
+
+    // 应用空间滤镜（保留边缘的平滑，补孔）
+    filtered_frame = spatial_filter.process( filtered_frame );
+
+    // 应用时间过滤器（使用多个先前的帧进行平滑处理）
+    filtered_frame = temporal_filter.process( filtered_frame );
+
+    // 从视差帧变换深度帧
+    rs2::disparity_transform depth_transform( false );
+    filtered_frame = depth_transform.process( filtered_frame );
+
     // unsigned long long frame_number = frames.get_frame_number();
-    depth_name = to_string(depth_count) + "_depth_image.png";
+    depth_name = to_string(depth_count) + "_depth_image_filter.png";
 
     // rs2::frame 转化为 cv::Mat
     // Mat depth_distance = depth_frame_to_meters(pipe, depth);
     Mat depth_image = frame_to_mat(depth);
     Mat color_image = frame_to_mat(color);
+    Mat filter_image = frame_to_mat(filtered_frame);
 
-    if (depth_count == 1) {
-      depth_total = Mat::zeros(depth_image.size(), CV_16UC1);
-    } else {
-      depth_total += depth_image;
-    }
-
-    cout << depth_image << endl;
-    depth_image.convertTo(depth_u8, CV_8UC1);
+    cout << "head" << endl;
+    // cout << depth_image << endl;
+    cout << filter_image << endl;
+    depth_image.convertTo(depth_u8, CV_8UC1, 255.0 / 10000.0);
+    filter_image.convertTo(filter_image_u8, CV_8UC1, 255.0 / 10000.0);
 
     imshow("depth_u8", depth_u8);
+    imshow("filter_image_u8", filter_image_u8);
 
     imwrite(depth_name, depth_image);
 
     cout << depth_count << endl;
+    // vector<vector<Point>> result;
+    // result = find_obstacle(filter_image, 20, 255, 2500);
 
-    while (depth_count == 3) {
-      depth_average = depth_total / 2;
-      imwrite("depth_average.png", depth_average);
-      depth_count = 0;
-    }
-
-    sleep(3);
+    // sleep(1);
     depth_count++;
     waitKey(1);
   }
@@ -296,26 +332,66 @@ int main(int argc, char **argv) {
     rs2::depth_frame depth = frames.get_depth_frame();
 
     // unsigned long long frame_number = frames.get_frame_number();
-    depth_name = to_string(depth_count) + "_depth_image.png";
 
     // rs2::frame 转化为 cv::Mat
     // Mat depth_distance = depth_frame_to_meters(pipe, depth);
-    Mat depth_image = frame_to_mat(depth);
+    Mat depth_image = Mat(depth_average.rows, depth_average.cols, CV_16SC1);
+    depth_image = frame_to_mat(depth);
+    cout << "flag" << endl;
+    // cout << depth_image << endl;
+
     Mat color_image = frame_to_mat(color);
 
     imshow("color_image", color_image);
 
     vector<vector<Point>> result;
+
     depth_image = depth_average - depth_image;
+    MatExpr abs(depth_image);
+    // depth_image
+    // cout << depth_image << endl;
+    result = find_obstacle(depth_image, 20, 255, 1500);
+
+    // depth_image.convertTo(depth_u8, CV_8UC1, 255.0 / 12000.0);
+
+    // imshow("depth", depth_image);
+    // imshow("depth_u8", depth_u8);
+    waitKey(1);
+  }
+
+#endif
+
+//分析数据
+#if 0
+  while (true) {
+    // Mat image_1 = imread("1_depth_image.png", IMREAD_ANYDEPTH);
+    // Mat image_2 = imread("2_depth_image.png", IMREAD_ANYDEPTH);
+    // Mat image_3 = imread("depth_average.png", IMREAD_ANYDEPTH);
+
+    // Mat differ = image_1 - image_3;
+    // cout << differ << endl;
+    // Mat media;
+    // medianBlur(differ, media, 5);
+    // cout << media << endl;
+    Mat depth_u8;
+    Mat depth_average = imread("depth_average.png", IMREAD_ANYDEPTH);
+
+    Mat depth_image = imread("1_depth_image.png", IMREAD_ANYDEPTH);
+
+    vector<vector<Point>> result;
+
+    depth_image = depth_average - depth_image;
+    MatExpr abs(depth_image);
+    cout << "head_row" << endl;
     cout << depth_image << endl;
     result = find_obstacle(depth_image, 20, 255, 2500);
 
-    depth_image.convertTo(depth_u8, CV_8UC1, 255.0 / 10000);
+    depth_image.convertTo(depth_u8, CV_8UC1, 255.0 / 5000.0);
 
     imshow("depth", depth_image);
     imshow("depth_u8", depth_u8);
     waitKey(1);
   }
-  #endif
+#endif
   return 1;
 }
